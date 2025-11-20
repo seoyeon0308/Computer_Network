@@ -1,0 +1,257 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <netinet/ip.h>
+#include <linux/if_packet.h>
+#include <net/ethernet.h>
+#include <netinet/tcp.h>
+#include <netinet/udp.h>
+
+// ========== 필터 설정 (원하는 것만 1로 변경) ==========
+#define SHOW_HTTP 1      // HTTP 패킷만 보기
+#define SHOW_DNS 1       // DNS 패킷만 보기
+#define SHOW_TCP 0       // 일반 TCP 패킷 보기
+#define SHOW_UDP 0       // 일반 UDP 패킷 보기
+#define SHOW_OTHER 0     // 기타 프로토콜 보기
+
+// 패킷 카운터
+int packet_count = 0;
+
+// ========== HTTP 분석 함수 ==========
+void parse_http(unsigned char *payload, int payload_len) {
+    if (payload_len <= 0) return;
+    
+    // HTTP 요청 확인
+    if (strncmp((char*)payload, "GET ", 4) == 0 ||
+        strncmp((char*)payload, "POST ", 5) == 0) {
+        
+        printf("\n[HTTP 요청]\n");
+        
+        char method[16] = {0};
+        sscanf((char*)payload, "%s", method);
+        printf("  └ 메서드: %s\n", method);
+        
+        char *host_start = strstr((char*)payload, "Host: ");
+        if (host_start) {
+            char host[256] = {0};
+            sscanf(host_start + 6, "%[^\r\n]", host);
+            printf("  └ Host: %s\n", host);
+        }
+        return;
+    }
+    // HTTP 응답 확인
+    else if (strncmp((char*)payload, "HTTP/", 5) == 0) {
+        printf("\n[HTTP 응답]\n");
+        
+        int status_code;
+        sscanf((char*)payload, "HTTP/%*s %d", &status_code);
+        printf("  └ 상태 코드: %d\n", status_code);
+        return;
+    }
+}
+
+// ========== DNS 헤더 구조체 ==========
+struct dns_header {
+    uint16_t id;
+    uint16_t flags;
+    uint16_t qdcount;
+    uint16_t ancount;
+    uint16_t nscount;
+    uint16_t arcount;
+};
+
+// DNS 도메인 이름 파싱
+void parse_dns_name(unsigned char *dns_start, unsigned char *name_ptr, char *output) {
+    unsigned char *p = name_ptr;
+    int pos = 0;
+    
+    while (*p != 0 && pos < 255) {
+        if ((*p & 0xC0) == 0xC0) {
+            break;
+        }
+        
+        int len = *p;
+        p++;
+        
+        for (int i = 0; i < len && pos < 254; i++) {
+            output[pos++] = *p++;
+        }
+        
+        if (*p != 0) {
+            output[pos++] = '.';
+        }
+    }
+    output[pos] = '\0';
+}
+
+// ========== DNS 분석 함수 ==========
+void parse_dns(unsigned char *payload, int payload_len) {
+    if (payload_len < sizeof(struct dns_header)) return;
+    
+    struct dns_header *dnsh = (struct dns_header*)payload;
+    
+    printf("\n[DNS 패킷]\n");
+    
+    uint16_t flags = ntohs(dnsh->flags);
+    int qr = (flags >> 15) & 0x01;
+    int rcode = flags & 0x0F;
+    
+    if (qr == 0) {
+        printf("  └ 타입: DNS 질의\n");
+        
+        if (ntohs(dnsh->qdcount) > 0) {
+            unsigned char *query_name = payload + sizeof(struct dns_header);
+            char domain[256] = {0};
+            parse_dns_name(payload, query_name, domain);
+            printf("  └ 질의 도메인: %s\n", domain);
+        }
+    } else {
+        printf("  └ 타입: DNS 응답\n");
+        printf("  └ 응답 코드: %d ", rcode);
+        
+        if (rcode == 0) printf("(성공)\n");
+        else if (rcode == 3) printf("(도메인 없음)\n");
+        else printf("(오류)\n");
+        
+        printf("  └ Transaction ID: 0x%04x\n", ntohs(dnsh->id));
+    }
+}
+
+// ========== TCP 분석 함수 ==========
+int parse_tcp(unsigned char *buffer, struct iphdr *iph, int iphdr_len) {
+    struct tcphdr *tcph = (struct tcphdr*)(buffer + sizeof(struct ethhdr) + iphdr_len);
+    int tcphdr_len = tcph->doff * 4;
+    
+    // HTTP 포트 확인 (80, 8080)
+    if (ntohs(tcph->dest) == 80 || ntohs(tcph->source) == 80 ||
+        ntohs(tcph->dest) == 8080 || ntohs(tcph->source) == 8080) {
+        
+        unsigned char *payload = buffer + sizeof(struct ethhdr) + iphdr_len + tcphdr_len;
+        int payload_len = ntohs(iph->tot_len) - iphdr_len - tcphdr_len;
+        
+        if (payload_len > 0) {
+            parse_http(payload, payload_len);
+            return 1;  // HTTP 패킷 발견
+        }
+    }
+    
+    // 일반 TCP 출력 (SHOW_TCP가 1일 때만)
+    if (SHOW_TCP) {
+        printf("\n[TCP 패킷]\n");
+        printf("  └ 출발지 포트: %u\n", ntohs(tcph->source));
+        printf("  └ 목적지 포트: %u\n", ntohs(tcph->dest));
+        printf("  └ Seq: %u, Ack: %u\n", ntohl(tcph->seq), ntohl(tcph->ack_seq));
+        
+        printf("  └ 플래그: ");
+        if (tcph->syn) printf("SYN ");
+        if (tcph->ack) printf("ACK ");
+        if (tcph->fin) printf("FIN ");
+        if (tcph->rst) printf("RST ");
+        printf("\n");
+        return 1;
+    }
+    
+    return 0;
+}
+
+// ========== UDP 분석 함수 ==========
+int parse_udp(unsigned char *buffer, struct iphdr *iph, int iphdr_len) {
+    struct udphdr *udph = (struct udphdr*)(buffer + sizeof(struct ethhdr) + iphdr_len);
+    
+    // DNS 포트 확인 (53)
+    if (ntohs(udph->dest) == 53 || ntohs(udph->source) == 53) {
+        unsigned char *payload = buffer + sizeof(struct ethhdr) + iphdr_len + sizeof(struct udphdr);
+        int payload_len = ntohs(udph->len) - sizeof(struct udphdr);
+        
+        parse_dns(payload, payload_len);
+        return 1;  // DNS 패킷 발견
+    }
+    
+    // 일반 UDP 출력 (SHOW_UDP가 1일 때만)
+    if (SHOW_UDP) {
+        printf("\n[UDP 패킷]\n");
+        printf("  └ 출발지 포트: %u\n", ntohs(udph->source));
+        printf("  └ 목적지 포트: %u\n", ntohs(udph->dest));
+        printf("  └ 길이: %u\n", ntohs(udph->len));
+        return 1;
+    }
+    
+    return 0;
+}
+
+// ========== 메인 패킷 처리 함수 ==========
+void process_packet(unsigned char *buffer, int size) {
+    if (size < 20) return;
+    
+    struct iphdr *iph = (struct iphdr*)(buffer + sizeof(struct ethhdr));
+    struct sockaddr_in src, dst;
+    
+    src.sin_addr.s_addr = iph->saddr;
+    dst.sin_addr.s_addr = iph->daddr;
+    
+    int iphdr_len = iph->ihl * 4;
+    int should_print = 0;  // 출력 여부 플래그
+    
+    // 프로토콜별 처리
+    if (iph->protocol == IPPROTO_TCP) {
+        should_print = parse_tcp(buffer, iph, iphdr_len);
+    }
+    else if (iph->protocol == IPPROTO_UDP) {
+        should_print = parse_udp(buffer, iph, iphdr_len);
+    }
+    else if (SHOW_OTHER) {
+        printf("\n[기타 프로토콜: %d]\n", iph->protocol);
+        should_print = 1;
+    }
+    
+    // 필터 통과한 패킷만 IP 정보 출력
+    if (should_print) {
+        packet_count++;
+        printf("  └ 출발지 IP: %s\n", inet_ntoa(src.sin_addr));
+        printf("  └ 목적지 IP: %s\n", inet_ntoa(dst.sin_addr));
+        printf("========================================\n");
+    }
+}
+
+// ========== 메인 함수 ==========
+int main() {
+    printf("╔════════════════════════════════════════╗\n");
+    printf("║    네트워크 패킷 스니퍼 (필터링 모드)    ║\n");
+    printf("╚════════════════════════════════════════╝\n\n");
+    
+    printf("📌 현재 필터 설정:\n");
+    printf("   HTTP: %s\n", SHOW_HTTP ? "ON ✓" : "OFF ✗");
+    printf("   DNS:  %s\n", SHOW_DNS ? "ON ✓" : "OFF ✗");
+    printf("   TCP:  %s\n", SHOW_TCP ? "ON ✓" : "OFF ✗");
+    printf("   UDP:  %s\n", SHOW_UDP ? "ON ✓" : "OFF ✗");
+    printf("\n(Ctrl+C로 종료)\n");
+    printf("========================================\n");
+    
+    // Raw 소켓 생성
+    int sockfd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    if (sockfd < 0) {
+        perror("소켓 생성 실패 (root 권한 필요)");
+        return 1;
+    }
+    
+    unsigned char buffer[65536];
+    
+    // 패킷 수신 루프
+    while (1) {
+        int size = recvfrom(sockfd, buffer, sizeof(buffer), 0, NULL, NULL);
+        if (size < 0) {
+            perror("패킷 수신 실패");
+            break;
+        }
+        
+        process_packet(buffer, size);
+    }
+    
+    close(sockfd);
+    printf("\n\n총 캡처된 패킷: %d개\n", packet_count);
+    return 0;
+}
