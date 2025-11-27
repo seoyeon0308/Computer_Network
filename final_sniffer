@@ -1,0 +1,360 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include <sys/socket.h>      // 소켓 관련 함수 선언
+#include <arpa/inet.h>       // IP 주소 변환 함수 사용
+#include <netinet/ip.h>      // IP 헤더 구조체 정의 포함
+#include <linux/if_packet.h> // RAW 소켓과 이더넷 헤더 정의
+#include <net/ethernet.h>    // 이더넷 프로토콜 상수 포함
+#include <netinet/tcp.h>
+#include <netinet/udp.h>
+
+// IP 헤더 출력 함수
+void print_ip_header(unsigned char *buffer) {
+    struct iphdr *iph = (struct iphdr*)(buffer + sizeof(struct ethhdr)); // 이더넷 헤더 크기만큼 건너뜀
+    struct sockaddr_in src, dst;
+
+    src.sin_addr.s_addr = iph->saddr; // 출발지 주소
+    dst.sin_addr.s_addr = iph->daddr; // 목적지 주소
+
+    // IP 주소와 프로토콜 번호 출력
+    printf("========== IP 헤더 정보 ==========\n");
+    printf("출발지 IP: %s\n", inet_ntoa(src.sin_addr));
+    printf("목적지 IP: %s\n", inet_ntoa(dst.sin_addr));
+    printf("프로토콜 번호: %u\n\n", (unsigned int)iph->protocol);
+}
+
+// TCP 상태 정의
+typedef enum {
+    TCP_STATE_NONE = 0,
+    TCP_STATE_SYN_SENT,
+    TCP_STATE_SYN_RECV,
+    TCP_STATE_ESTABLISHED,
+    TCP_STATE_FIN_WAIT,
+    TCP_STATE_CLOSED
+} tcp_state_t;
+
+// TCP 연결 정보
+typedef struct tcp_conn {
+    uint32_t saddr, daddr;
+    uint16_t sport, dport;
+    tcp_state_t state;
+    struct tcp_conn *next;
+} tcp_conn_t;
+
+tcp_conn_t *conn_head = NULL;
+
+// 연결 탐색
+tcp_conn_t *find_conn(uint32_t s, uint32_t d, uint16_t sp, uint16_t dp) {
+    tcp_conn_t *cur = conn_head;
+    while (cur) {
+        if (cur->saddr == s && cur->daddr == d &&
+            cur->sport == sp && cur->dport == dp)
+            return cur;
+        cur = cur->next;
+    }
+    return NULL;
+}
+
+// 연결 추가
+tcp_conn_t *add_conn(uint32_t s, uint32_t d, uint16_t sp, uint16_t dp) {
+    tcp_conn_t *c = malloc(sizeof(tcp_conn_t));
+    c->saddr = s;
+    c->daddr = d;
+    c->sport = sp;
+    c->dport = dp;
+    c->state = TCP_STATE_NONE;
+    c->next = conn_head;
+    conn_head = c;
+    return c;
+}
+
+// TCP 상태 출력
+void print_tcp_state(tcp_conn_t *c) {
+    struct in_addr s, d;
+    s.s_addr = c->saddr;
+    d.s_addr = c->daddr;
+    const char *st =
+        (c->state == TCP_STATE_SYN_SENT) ? "SYN_SENT" :
+        (c->state == TCP_STATE_SYN_RECV) ? "SYN_RECV" :
+        (c->state == TCP_STATE_ESTABLISHED) ? "ESTABLISHED" :
+        (c->state == TCP_STATE_FIN_WAIT) ? "FIN_WAIT" :
+        (c->state == TCP_STATE_CLOSED) ? "CLOSED" : "NONE";
+
+    printf("[TCP STATE] %s:%u -> %s:%u : %s\n",
+           inet_ntoa(s), ntohs(c->sport),
+           inet_ntoa(d), ntohs(c->dport),
+           st);
+}
+
+// TCP 상태 업데이트
+void update_tcp_state(tcp_conn_t *c, uint8_t flags) {
+    tcp_state_t prev = c->state;
+
+    if (flags & TH_SYN && !(flags & TH_ACK)) c->state = TCP_STATE_SYN_SENT;
+    else if (flags & TH_SYN && (flags & TH_ACK)) c->state = TCP_STATE_SYN_RECV;
+    else if ((flags & TH_ACK) && c->state == TCP_STATE_SYN_RECV) c->state = TCP_STATE_ESTABLISHED;
+    else if (flags & TH_FIN) c->state = TCP_STATE_FIN_WAIT;
+    else if (flags & TH_RST) c->state = TCP_STATE_CLOSED;
+
+    if (prev != c->state)
+        print_tcp_state(c);
+}
+
+
+// TCP/UDP 헤더 분석 함수
+void parse_transport(unsigned char *buffer, int size) {
+    struct iphdr *iph = (struct iphdr*)(buffer + sizeof(struct ethhdr));
+    int iphdr_len = iph->ihl * 4;
+
+    if (iph->protocol == IPPROTO_TCP) {
+        struct tcphdr *tcph = (struct tcphdr*)(buffer + sizeof(struct ethhdr) + iphdr_len);
+
+        printf("----- TCP 헤더 -----\n");
+        printf("출발지 포트: %u\n", ntohs(tcph->source));
+        printf("목적지 포트: %u\n", ntohs(tcph->dest));
+
+        uint8_t flags = *((unsigned char*)tcph + 13);
+
+        // TCP 연결 추적
+        tcp_conn_t *c = find_conn(iph->saddr, iph->daddr, tcph->source, tcph->dest);
+        if (!c) c = add_conn(iph->saddr, iph->daddr, tcph->source, tcph->dest);
+
+        update_tcp_state(c, flags);
+
+        printf("--------------------\n");
+    }
+    else if (iph->protocol == IPPROTO_UDP) {
+        struct udphdr *udph = (struct udphdr*)(buffer + sizeof(struct ethhdr) + iphdr_len);
+
+        printf("----- UDP 헤더 -----\n");
+        printf("출발지 포트: %u\n", ntohs(udph->source));
+        printf("목적지 포트: %u\n", ntohs(udph->dest));
+        printf("길이: %u\n", ntohs(udph->len));
+        printf("--------------------\n");
+    }
+}
+
+
+
+
+// ========== HTTP 분석 함수 ==========
+void parse_http(unsigned char *payload, int payload_len) {
+    if (payload_len <= 0) return;
+    
+    // HTTP 요청 확인
+    if (strncmp((char*)payload, "GET ", 4) == 0 ||
+        strncmp((char*)payload, "POST ", 5) == 0) {
+        
+        printf("\n[HTTP 분석]\n");
+        
+        // 메서드 추출
+        char method[16] = {0};
+        sscanf((char*)payload, "%s", method);
+        printf("  └ 메서드: %s\n", method);
+        
+        // Host 헤더 찾기
+        char *host_start = strstr((char*)payload, "Host: ");
+        if (host_start) {
+            char host[256] = {0};
+            sscanf(host_start + 6, "%[^\r\n]", host);
+            printf("  └ Host: %s\n", host);
+        }
+    }
+    // HTTP 응답 확인
+    else if (strncmp((char*)payload, "HTTP/", 5) == 0) {
+        printf("\n[HTTP 분석]\n");
+        
+        int status_code;
+        sscanf((char*)payload, "HTTP/%*s %d", &status_code);
+        printf("  └ 상태 코드: %d\n", status_code);
+    }
+}
+
+// ========== DNS 헤더 구조체 ==========
+struct dns_header {
+    uint16_t id;
+    uint16_t flags;
+    uint16_t qdcount;
+    uint16_t ancount;
+    uint16_t nscount;
+    uint16_t arcount;
+};
+
+// DNS 도메인 이름 파싱 (간단 버전)
+void parse_dns_name(unsigned char *dns_start, unsigned char *name_ptr, char *output) {
+    unsigned char *p = name_ptr;
+    int pos = 0;
+    
+    while (*p != 0 && pos < 255) {
+        if ((*p & 0xC0) == 0xC0) {
+            // 압축 포인터 - 단순히 중단
+            break;
+        }
+        
+        int len = *p;
+        p++;
+        
+        for (int i = 0; i < len && pos < 254; i++) {
+            output[pos++] = *p++;
+        }
+        
+        if (*p != 0) {
+            output[pos++] = '.';
+        }
+    }
+    output[pos] = '\0';
+}
+
+// ========== DNS 분석 함수 ==========
+void parse_dns(unsigned char *payload, int payload_len) {
+    if (payload_len < sizeof(struct dns_header)) return;
+    
+    struct dns_header *dnsh = (struct dns_header*)payload;
+    
+    printf("\n[DNS 분석]\n");
+    
+    uint16_t flags = ntohs(dnsh->flags);
+    int qr = (flags >> 15) & 0x01;
+    int rcode = flags & 0x0F;
+    
+    if (qr == 0) {
+        printf("  └ 타입: DNS 질의\n");
+        
+        // 질의 도메인 파싱
+        if (ntohs(dnsh->qdcount) > 0) {
+            unsigned char *query_name = payload + sizeof(struct dns_header);
+            char domain[256] = {0};
+            parse_dns_name(payload, query_name, domain);
+            printf("  └ 질의 도메인: %s\n", domain);
+        }
+    } else {
+        printf("  └ 타입: DNS 응답\n");
+        printf("  └ 응답 코드: %d ", rcode);
+        
+        if (rcode == 0) printf("(성공)\n");
+        else if (rcode == 3) printf("(도메인 없음)\n");
+        else printf("(오류)\n");
+        
+        // Transaction ID 출력
+        printf("  └ Transaction ID: 0x%04x\n", ntohs(dnsh->id));
+    }
+}
+
+// ========== TCP 분석 함수 ==========
+void parse_tcp(unsigned char *buffer, struct iphdr *iph, int iphdr_len) {
+    struct tcphdr *tcph = (struct tcphdr*)(buffer + sizeof(struct ethhdr) + iphdr_len);
+    int tcphdr_len = tcph->doff * 4;
+    
+    printf("\n[TCP 헤더 분석]\n");
+    printf("  └ 출발지 포트: %u\n", ntohs(tcph->source));
+    printf("  └ 목적지 포트: %u\n", ntohs(tcph->dest));
+    printf("  └ Seq 번호: %u\n", ntohl(tcph->seq));
+    printf("  └ Ack 번호: %u\n", ntohl(tcph->ack_seq));
+    
+    // 제어 비트
+    printf("  └ 제어 비트: ");
+    if (tcph->syn) printf("SYN ");
+    if (tcph->ack) printf("ACK ");
+    if (tcph->fin) printf("FIN ");
+    if (tcph->rst) printf("RST ");
+    printf("\n");
+    
+    // HTTP 포트 확인 (80, 8080)
+    if (ntohs(tcph->dest) == 80 || ntohs(tcph->source) == 80 ||
+        ntohs(tcph->dest) == 8080 || ntohs(tcph->source) == 8080) {
+        
+        unsigned char *payload = buffer + sizeof(struct ethhdr) + iphdr_len + tcphdr_len;
+        int payload_len = ntohs(iph->tot_len) - iphdr_len - tcphdr_len;
+        
+        parse_http(payload, payload_len);
+    }
+}
+
+// ========== UDP 분석 함수 ==========
+void parse_udp(unsigned char *buffer, struct iphdr *iph, int iphdr_len) {
+    struct udphdr *udph = (struct udphdr*)(buffer + sizeof(struct ethhdr) + iphdr_len);
+    
+    printf("\n[UDP 헤더 분석]\n");
+    printf("  └ 출발지 포트: %u\n", ntohs(udph->source));
+    printf("  └ 목적지 포트: %u\n", ntohs(udph->dest));
+    printf("  └ 길이: %u\n", ntohs(udph->len));
+    printf("  └ 체크섬: 0x%04x\n", ntohs(udph->check));
+    
+    // DNS 포트 확인 (53)
+    if (ntohs(udph->dest) == 53 || ntohs(udph->source) == 53) {
+        unsigned char *payload = buffer + sizeof(struct ethhdr) + iphdr_len + sizeof(struct udphdr);
+        int payload_len = ntohs(udph->len) - sizeof(struct udphdr);
+        
+        parse_dns(payload, payload_len);
+    }
+}
+
+// ========== 메인 패킷 처리 함수 ==========
+void process_packet(unsigned char *buffer, int size) {
+    // 패킷 크기 체크
+    if (size < 20) {
+        printf("[오류] 패킷이 너무 작습니다\n");
+        return;
+    }
+    
+    struct iphdr *iph = (struct iphdr*)(buffer + sizeof(struct ethhdr));
+    struct sockaddr_in src, dst;
+    
+    src.sin_addr.s_addr = iph->saddr;
+    dst.sin_addr.s_addr = iph->daddr;
+    
+    printf("\n========================================\n");
+    printf("[IP 헤더 분석]\n");
+    printf("  └ 출발지 IP: %s\n", inet_ntoa(src.sin_addr));
+    printf("  └ 목적지 IP: %s\n", inet_ntoa(dst.sin_addr));
+    printf("  └ 프로토콜: ");
+    
+    int iphdr_len = iph->ihl * 4;
+    
+    // 프로토콜 분기
+    if (iph->protocol == IPPROTO_TCP) {
+        printf("TCP\n");
+        parse_tcp(buffer, iph, iphdr_len);
+    }
+    else if (iph->protocol == IPPROTO_UDP) {
+        printf("UDP\n");
+        parse_udp(buffer, iph, iphdr_len);
+    }
+    else {
+        printf("기타 (%d)\n", iph->protocol);
+    }
+    
+    printf("========================================\n");
+}
+
+// ========== 메인 함수 ==========
+int main() {
+    printf("패킷 스니퍼 시작...\n");
+    printf("(Ctrl+C로 종료)\n\n");
+    
+    // Raw 소켓 생성
+    int sockfd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    if (sockfd < 0) {
+        perror("소켓 생성 실패 (root 권한 필요)");
+        return 1;
+    }
+    
+    unsigned char buffer[65536];
+    
+    // 패킷 수신 루프
+    while (1) {
+        int size = recvfrom(sockfd, buffer, sizeof(buffer), 0, NULL, NULL);
+        if (size < 0) {
+            perror("패킷 수신 실패");
+            break;
+        }
+        
+        process_packet(buffer, size);
+    }
+    
+    close(sockfd);
+    return 0;
+}
